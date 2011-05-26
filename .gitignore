@@ -12,3 +12,6 @@ settings_local.py
 pip-log.txt
 logs/
 cacheable/
+
+# Database
+parliament.sqlite
