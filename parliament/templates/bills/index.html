@@ -7,14 +7,14 @@
 
 {% if votes %}
 <div class="context"><h2>{% if session_list %}Recent votes{% else %}Votes{% endif %}</h2></div>
-<div class="focus"><ul class="tile">{% for vote in votes %}<li class="six twoline overflowtip"><a href="{{ vote.get_absolute_url }}">#{{ vote.number }}</a> <span class="tag voteresult_{{ vote.result }}">{{ vote.get_result_display }}</span> {% if vote.bill %}<a href="{{ vote.bill.get_absolute_url }}">{{ vote.bill.number }}</a> {% endif %}{{ vote.description }}</li>{% endfor %}</ul><div class="clear"></div>{% if votes.0.number > 6 %}<p>See <a href="{% url parliament.bills.views.votes_for_session session_id=session.id %}">all {{ votes.0.number }} votes</a> for this session.</p>{% endif %}</div><div class="clear"></div>
+<div class="focus"><ul class="tile">{% for vote in votes %}<li class="six twoline overflowtip"><a href="{{ vote.get_absolute_url }}">#{{ vote.number }}</a> <span class="tag voteresult_{{ vote.result }}">{{ vote.get_result_display }}</span> {% if vote.bill %}<a href="{% url bill session_id=session.id bill_number=vote.bill.number %}">{{ vote.bill.number }}</a> {% endif %}{{ vote.description }}</li>{% endfor %}</ul><div class="clear"></div>{% if votes.0.number > 6 %}<p>See <a href="{% url parliament.bills.views.votes_for_session session_id=session.id %}">all {{ votes.0.number }} votes</a> for this session.</p>{% endif %}</div><div class="clear"></div>
 {% endif %}
 
 {% regroup object_list by privatemember as pmem %}
 {% for pm in pmem %}
 
 {% if forloop.counter == 2 %}{% block sessions_list %}
-<div class="focus"><p>Bills are separated according to the parliamentary session during which they were introduced. The bills above have been introduced in the current session. (Or reintroduced&mdash;a bill which has not been withdrawn is automatically reintroduced in subsequent sessions.)</p></div>
+<div class="focus"><p>Bills are separated according to the parliamentary session during which they were introduced. The bills above have been introduced (or reintroduced) in the current session.</p></div>
 <div class="clear"></div><div class="context"><h2>Sessions</h2></div>
 <div class="focus"><ul class="tile">
     {% for session in session_list %}{% if not forloop.first %}
@@ -24,7 +24,7 @@
 {% if pm.grouper %}<div class="focus"><p>Private members' bills are introduced by MPs who are not cabinet ministers&mdash;opposition members, or sometimes government backbenchers. They rarely become law.</p></div>{% endif %}
 <div class="clear"></div><div class="context"><h2>{% if pm.grouper %}Private members' bills{% else %}Government bills{% endif %}</h2></div><div class="focus">
     <ul class="tile">
-    {% for bill in pm.list %}<li class="twoline six overflowtip"><a href="{% url parliament.bills.views.bill session_id=session.id bill_number=bill.number %}">{{ bill.number }}</a> {% if bill.law %}<span class="tag bill_law">Law</span> {% endif %}{{ bill.name|strip_act }}</li>{% endfor %}
+    {% for bill in pm.list %}{% if bill.number_only != 1 %}<li class="twoline six overflowtip"><a href="{% url parliament.bills.views.bill session_id=session.id bill_number=bill.number %}">{{ bill.number }}</a> {% if bill.law %}<span class="tag bill_law">Law</span> {% endif %}{{ bill.name|strip_act }}</li>{% endif %}{% endfor %}
     </ul><div class="clear"></div>
 </div>
 {% endfor %}

@@ -5,52 +5,35 @@ Production code should NOT import from this file."""
 import sys, re, urllib, urllib2, os, csv
 from collections import defaultdict
 import urlparse
-import itertools
-from operator import itemgetter
-from heapq import nlargest
 
 from django.db import transaction, models
 from django.db.models import Count
 from django.core.files import File
 from django.conf import settings
-from django.template.defaultfilters import slugify
-from BeautifulSoup import BeautifulSoup
 
-from parliament.imports import hans
-from parliament.core import parsetools, text_utils
 from parliament.core.models import *
-from parliament.hansards.models import Hansard, HansardCache, Statement
+from parliament.hansards.models import Statement
 from parliament.elections.models import Election, Candidacy
 
-def update_hansards():
-    hansards_from_calendar()
-    parse_all_hansards()
-
-def load_pol_pics():
-    for pol in Politician.objects.exclude(parlpage='').filter(models.Q(headshot__isnull=True) | models.Q(headshot='')):
-        print "#%d: %s" % (pol.id, pol)
-        print pol.parlpage
-        soup = BeautifulSoup(urllib2.urlopen(pol.parlpage))
-        img = soup.find('img', id='MasterPage_MasterPage_BodyContent_PageContent_Content_TombstoneContent_TombstoneContent_ucHeaderMP_imgPhoto')
-        if not img:
-            img = soup.find('img', id="ctl00_cphContent_imgParliamentarianPicture")
-            if not img:
-                raise Exception("Didn't work for %s" % pol.parlpage)
-        imgurl = img['src']
-        if '?' not in imgurl: # no query string
-            imgurl = urllib.quote(imgurl.encode('utf8')) # but there might be accents!
-        imgurl = urlparse.urljoin(pol.parlpage, imgurl)
-        try:
-            test = urllib2.urlopen(imgurl)
-            content = urllib.urlretrieve(imgurl)
-        except Exception, e:
-            print "ERROR ON %s" % pol
-            print e
-            print imgurl
-            continue
-        #filename = urlparse.urlparse(imgurl).path.split('/')[-1]
-        pol.headshot.save(str(pol.id) + ".jpg", File(open(content[0])), save=True)
-        pol.save()
+def load_pol_pic(pol):
+    print "#%d: %s" % (pol.id, pol)
+    print pol.parlpage
+    soup = BeautifulSoup(urllib2.urlopen(pol.parlpage))
+    img = soup.find('img', id='MasterPage_MasterPage_BodyContent_PageContent_Content_TombstoneContent_TombstoneContent_ucHeaderMP_imgPhoto')
+    if not img:
+        raise Exception("Didn't work for %s" % pol.parlpage)
+    imgurl = img['src']
+    if '?' not in imgurl: # no query string
+        imgurl = urllib.quote(imgurl.encode('utf8')) # but there might be accents!
+    if 'BlankMPPhoto' in imgurl:
+        print "Blank photo"
+        return
+    imgurl = urlparse.urljoin(pol.parlpage, imgurl)
+    test = urllib2.urlopen(imgurl)
+    content = urllib.urlretrieve(imgurl)
+    #filename = urlparse.urlparse(imgurl).path.split('/')[-1]
+    pol.headshot.save(str(pol.id) + ".jpg", File(open(content[0])), save=True)
+    pol.save()
 
 def delete_invalid_pol_pics():
     from PIL import Image
@@ -73,26 +56,6 @@ def delete_invalid_pol_urls():
             print "REMOVING %s " % site
             print e
             pol.politicianinfo_set.filter(schema='web_site').delete()
-
-
-def parse_all_hansards(): 
-    parsed = []
-    for hansard in Hansard.objects.all().annotate(scount=Count('statement')).exclude(scount__gt=0).order_by('date').iterator():
-        try:
-            print "Trying %d %s... " % (hansard.id, hansard)
-            hans.parseAndSave(hansard)
-            print "SUCCESS for %s" % hansard
-            parsed.append(hansard)
-        except Exception, e:
-            print "******* FAILURE **********"
-            print "ERROR: %s" % e
-            print "EXCEPTION TYPE: %s" % e.__class__
-            cache = HansardCache.objects.get(hansard=hansard.id)
-            print "HANSARD %d: %s" % (cache.hansard.id, cache.hansard)
-            print "FILE: %s" % cache.filename
-            print "URL: %s" % cache.hansard.url
-    return parsed
-        
         
 def export_words(outfile, queryset=None):
     if queryset is None:
@@ -136,7 +99,7 @@ def spark_index(bucketsize, bigrams=False):
             bucketcount = 0
             bucketidx += 1
             
-def get_parlinfo_ids(polset=Politician.objects.filter(parlpage__icontains='webinfo.parl')):
+def get_parlinfo_ids(polset):
     
     for pol in polset:
         page = urllib2.urlopen(pol.parlpage)
@@ -155,14 +118,6 @@ def normalize_hansard_urls():
         if normalized != h.url:
             h.url = normalized
             h.save()
-
-def cache_hansards():
-    for h in Hansard.objects.filter(url__icontains='http'):
-        try:
-            print "Loading %s..." % h
-            hans.loadHansard(h)
-        except Exception, e:
-            print "Failure %s" % e
 
 def populate_members_by():
     for by in Election.objects.filter(byelection=True):
@@ -234,6 +189,13 @@ def _merge_pols(good, bad):
             xref.save()
             seen.add((xref.int_value, xref.text_value))
     bad.delete()
+
+    pi_seen = set()
+    for pi in good.politicianinfo_set.all():
+        val = (pi.schema, pi.value)
+        if val in pi_seen:
+            pi.delete()
+        pi_seen.add(val)
 
 #REFORM = (Party.objects.get(pk=25), Party.objects.get(pk=1), Party.objects.get(pk=28), Party.objects.get(pk=26))
 
@@ -314,22 +276,22 @@ def merge_polnames():
     
 @transaction.commit_on_success
 def merge_pols():
-    print "Enter ID of primary pol object: ",
-    goodid = int(sys.stdin.readline().strip())
+    print "Enter ID of primary pol object: "
+    goodid = int(raw_input().strip())
     good = Politician.objects.get(pk=goodid)
     for em in ElectedMember.objects.filter(politician=good):
         print em
     for cand in Candidacy.objects.filter(candidate=good):
         print cand
-    print "Enter ID of bad pol object: ",
-    badid = int(sys.stdin.readline().strip())
+    print "Enter ID of bad pol object: "
+    badid = int(raw_input().strip())
     bad = Politician.objects.get(pk=badid)
     for em in ElectedMember.objects.filter(politician=bad):
         print em
     for cand in Candidacy.objects.filter(candidate=bad):
         print cand
-    print "Go? (y/n) ",
-    yn = sys.stdin.readline().strip().lower()
+    print "Go? (y/n) "
+    yn = raw_input().strip().lower()
     if yn == 'y':
         _merge_pols(good, bad)
         print "Done!"

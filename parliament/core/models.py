@@ -8,14 +8,19 @@ import re
 import urllib, urllib2
 
 from django.conf import settings
+from django.core.cache import cache
 from django.db import models
+from django.template.defaultfilters import slugify
 
 from BeautifulSoup import BeautifulSoup
 
 from parliament.core import parsetools, text_utils
 from parliament.core.utils import memoize_property, ActiveManager
 
-POL_LOOKUP_URL = 'http://webinfo.parl.gc.ca/MembersOfParliament/ProfileMP.aspx?Key=%d&Language=E'
+import logging
+logger = logging.getLogger(__name__)
+
+POL_LOOKUP_URL = 'http://www.parl.gc.ca/MembersOfParliament/ProfileMP.aspx?Key=%d&Language=E'
 
 class InternalXref(models.Model):
     """A general-purpose table for quickly storing internal links."""
@@ -208,16 +213,20 @@ class PoliticianManager(models.Manager):
         try:
             info = PoliticianInfo.sr_objects.get(schema='parl_id', value=unicode(parlid))
             return info.politician
-            # FIXME label-as-invalid functionality
-            #if polid < 0:
-            #    raise Politician.DoesNotExist("Stored as invalid parlID")
         except PoliticianInfo.DoesNotExist:
+            invalid_ID_cache_key = 'invalid-pol-parl-id-%s' % parlid
+            if cache.get(invalid_ID_cache_key):
+                raise Politician.DoesNotExist("ID %s cached as invalid" % parlid)
             if not lookOnline:
                 return None # FIXME inconsistent behaviour: when should we return None vs. exception?
             #print "Unknown parlid %d... " % parlid,
-            soup = BeautifulSoup(urllib2.urlopen(POL_LOOKUP_URL % parlid))
+            try:
+                soup = BeautifulSoup(urllib2.urlopen(POL_LOOKUP_URL % parlid))
+            except urllib2.HTTPError:
+                cache.set(invalid_ID_cache_key, True, 300)
+                raise Politician.DoesNotExist("Couldn't open " + (POL_LOOKUP_URL % parlid))
             if soup.find('table', id='MasterPage_BodyContent_PageContent_PageContent_pnlError'):
-                #print "Error page for parlid %d" % parlid
+                cache.set(invalid_ID_cache_key, True, 300)
                 raise Politician.DoesNotExist("Invalid page for parlid %s" % parlid)
             polname = soup.find('span', id='MasterPage_MasterPage_BodyContent_PageContent_Content_TombstoneContent_TombstoneContent_ucHeaderMP_lblMPNameData').string
             polriding = soup.find('a', id='MasterPage_MasterPage_BodyContent_PageContent_Content_TombstoneContent_TombstoneContent_ucHeaderMP_hlConstituencyProfile').string
@@ -247,26 +256,34 @@ class Politician(Person):
         ('F', 'Female'),
     )
 
+    WORDCLOUD_PATH = 'autoimg/wordcloud-pol'
+
     dob = models.DateField(blank=True, null=True)
-    site = models.URLField(blank=True, verify_exists=False) # FIXME remove
-    parlpage = models.URLField(blank=True, verify_exists=False) # FIXME remove
     gender = models.CharField(max_length=1, blank=True, choices=GENDER_CHOICES)
     headshot = models.ImageField(upload_to='polpics', blank=True, null=True)
     slug = models.CharField(max_length=30, blank=True, db_index=True)
     
     objects = PoliticianManager()
-    
-    def __init__(self, *args, **kwargs):
-        # If we're creating a new object, set a flag to save the name to the alternate-names table.
-        super(Politician, self).__init__(*args, **kwargs)
-        self._saveAlternate = True
         
     def add_alternate_name(self, name):
-        self.set_info_multivalued('alternate_name', parsetools.normalizeName(name))
+        normname = parsetools.normalizeName(name)
+        if normname not in self.alternate_names():
+            self.set_info_multivalued('alternate_name', normname)
 
     def alternate_names(self):
         """Returns a list of ways of writing this politician's name."""
         return self.politicianinfo_set.filter(schema='alternate_name').values_list('value', flat=True)
+        
+    def add_slug(self):
+        """Assigns a slug to this politician, unless there's a conflict."""
+        if self.slug:
+            return True
+        slug = slugify(self.name)
+        if Politician.objects.filter(slug=slug).exists():
+            logger.warning("Slug %s already taken" % slug)
+            return False
+        self.slug = slug
+        self.save()
         
     @property
     @memoize_property
@@ -298,10 +315,9 @@ class Politician(Person):
         except IndexError:
             return None
         
-    def save(self):
-        super(Politician, self).save()
-        if getattr(self, '_saveAlternate', False):
-            self.add_alternate_name(self.name)
+    def save(self, *args, **kwargs):
+        super(Politician, self).save(*args, **kwargs)
+        self.add_alternate_name(self.name)
 
     def save_parl_id(self, parlid):
         if PoliticianInfo.objects.filter(schema='parl_id', value=unicode(parlid)).exists():
@@ -314,13 +330,24 @@ class Politician(Person):
     @models.permalink
     def get_absolute_url(self):
         if self.slug:
-            return ('parliament.politicians.views.politician', [], {'pol_slug': self.slug})
+            return 'parliament.politicians.views.politician', [], {'pol_slug': self.slug}
         return ('parliament.politicians.views.politician', [], {'pol_id': self.id})
+
+    @property
+    def identifier(self):
+        return self.slug if self.slug else self.id
         
     # temporary, hackish, for stupid api framework
     @property
     def url(self):
         return "http://openparliament.ca" + self.get_absolute_url()
+
+    @property
+    def parlpage(self):
+        try:
+            return "http://www.parl.gc.ca/MembersOfParliament/ProfileMP.aspx?Key=%s&Language=E" % self.info()['parl_id']
+        except KeyError:
+            return None
         
     @models.permalink
     def get_contact_url(self):
@@ -350,14 +377,45 @@ class Politician(Person):
             info = self.politicianinfo_set.get(schema=key)
         except PoliticianInfo.DoesNotExist:
             info = PoliticianInfo(politician=self, schema=key)
+        except PoliticianInfo.MultipleObjectsReturned:
+            logger.error("Multiple objects found for schema %s on politician %r: %r" %
+                (key, self,
+                 self.politicianinfo_set.filter(schema=key).values_list('value', flat=True)
+                    ))
+            self.politicianinfo_set.filter(schema=key).delete()
+            info = PoliticianInfo(politician=self, schema=key)
         info.value = unicode(value)
         info.save()
         
     def set_info_multivalued(self, key, value):
         PoliticianInfo.objects.get_or_create(politician=self, schema=key, value=unicode(value))
+
+    def del_info(self, key):
+        self.politicianinfo_set.filter(schema=key).delete()
         
-    def find_favourite_word(self):
-        self.set_info('favourite_word', text_utils.most_frequent_word(self.statement_set.all()))
+    def find_favourite_word(self, wordcloud=True):
+        statements = self.statement_set.filter(procedural=False)
+        if self.current_member:
+            # For current members, we limit to the last two years for better
+            # comparison, and require at least 2,500 total words.
+            statements = statements.filter(time__gte=datetime.datetime.now() - datetime.timedelta(weeks=100))
+            min_words = 2500
+        else:
+            # For ex-members, we use everything they said
+            min_words = 5000
+        total_words = sum((s.wordcount for s in statements))
+        if total_words < min_words:
+            self.del_info('favourite_word')
+            self.del_info('wordcloud')
+            return
+        self.set_info('favourite_word', text_utils.most_frequent_word(statements))
+        if wordcloud:
+            image = text_utils.statements_to_cloud(statements)
+            path = os.path.join(self.WORDCLOUD_PATH, "%s.png" % (self.slug if self.slug else self.id))
+            fullpath = os.path.join(settings.MEDIA_ROOT, path)
+            with open(fullpath, 'wb') as f:
+                f.write(image)
+            self.set_info('wordcloud', path)
         
 class PoliticianInfoManager(models.Manager):
     """Custom manager ensures we always pull in the politician FK."""
@@ -399,7 +457,27 @@ class SessionManager(models.Manager):
     
     def current(self):
         return self.get_query_set().order_by('-start')[0]
-        
+
+    def get_by_date(self, date):
+        return self.filter(models.Q(end__isnull=True) | models.Q(end__gte=date))\
+            .get(start__lte=date)
+
+    def get_from_string(self, string):
+        """Given a string like '41st Parliament, 1st Session, returns the session."""
+        match = re.search(r'^(\d\d)\D+(\d)\D', string)
+        if not match:
+            raise ValueError(u"Could not find parl/session in %s" % string)
+        pk = match.group(1) + '-' + match.group(2)
+        return self.get_query_set().get(pk=pk)
+
+    def get_from_parl_url(self, url):
+        """Given a parl.gc.ca URL with Parl= and Ses= query-string parameters,
+        return the session."""
+        parlnum = re.search(r'Parl=(\d\d)', url).group(1)
+        sessnum = re.search(r'Ses=(\d)', url).group(1)
+        pk = parlnum + '-' + sessnum
+        return self.get_query_set().get(pk=pk)
+
 class Session(models.Model):
     "A session of Parliament."
     

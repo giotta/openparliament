@@ -4,47 +4,39 @@
 {% block pagetitle %}Keeping tabs on Canada’s Parliament{% endblock %}
 {% block breadcrumbs_all %}{% endblock %}
 {% block pageheading %}Keep tabs on Parliament.{% endblock %}
+{% block bodyclass %}home{% endblock %}
 {% block content %}
 <div class="focus">
-    <form action="/search/" id="home_searchform" method="GET"><div><input type="text" id="home_searchbox" name="q"><input type="submit" value="Search" class="button" id="searchbutton"></div></form></div>
+    <form action="/search/" id="home_searchform" method="GET">
+		{% include "search/searchbox.inc" with placeholder="Enter a postal code, name, or phrase" %}
+		<input type="submit" value="Search" class="btn btn-success" id="home_searchbutton">
+	</form>
+</div>
     <div class="clear"></div><div class="context"><h2>What we’re doing</h2></div>
     <div class="focus">
     <p>Info on what your representatives are doing in Ottawa can be hard to find and use. <strong>We’re trying to make it easy.</strong></p>
-    <p>Browse <a href="{% url parliament.politicians.views.current_mps %}">MPs</a>, or find someone quickly by entering
-        a name or postal code above. See what your representatives are <a href="{% url parliament.hansards.views.index %}">saying</a>, and what <a href="{% url parliament.bills.views.index %}">laws</a> they’re proposing. Poke around.</p></div>
+    <p><strong>Find your MP</strong> by entering your postal code above. See what your representatives are <a href="{% url parliament.hansards.views.index %}">saying</a>, and what <a href="{% url parliament.bills.views.index %}">laws</a> they’re proposing. Poke around.</p></div>
         <div class="clear"></div><div class="context"><h2>What they’re talking about</h2></div>
-        <div class="focus"><p>The latest House transcript is from <strong>{{ latest_hansard.date|date:"F jS"}}</strong>{% if latest_hansard.wordoftheday %}, when the <span class="tip tipunderline" title="Most frequently spoken word, excluding a fixed list of extra-boring words (like 'the', or 'government').">word of the day</span> was {% if latest_hansard.wordcloud %}<a href="{{ latest_hansard.wordcloud.url }}" rel="lightbox">{{ latest_hansard.wordoftheday }}</a>{% else %}{{ latest_hansard.wordoftheday}}{% endif %}{% endif %}. These are the topics that were discussed.</p><div class="spacer"></div><ul class="tile clearafter">
-        {% for topic in latest_hansard.topics_with_qp %}<li class="four oneline overflowtip"><a href="{% url parliament.hansards.views.hansard hansard_id=latest_hansard.id statement_seq=topic.1 %}#hl">{{ topic.0 }}</a></li>{% endfor %}
+        <div class="focus"><p>The latest House transcript is from <strong>{{ latest_hansard.date|date:"F jS"}}</strong>{% if latest_hansard.most_frequent_word %}, when the <span class="tip tipunderline" title="Most frequently spoken word, excluding a fixed list of extra-boring words (like 'the', or 'government').">word of the day</span> was {% if latest_hansard.wordcloud %}<a href="{{ latest_hansard.wordcloud.url }}" rel="lightbox">{{ latest_hansard.most_frequent_word }}</a>{% else %}{{ latest_hansard.most_frequent_word}}{% endif %}{% endif %}. These are the topics that were discussed.</p><div class="spacer"></div><ul class="tile clearafter">
+        	{% with latest_hansard.get_absolute_url as latest_hansard_url %}
+				{% for topic in latest_hansard.topics_with_qp %}<li class="four oneline overflowtip"><a href="{{ latest_hansard_url }}{{ topic.1 }}/#hl">{{ topic.0 }}</a></li>{% endfor %}
+			{% endwith %}
         </ul><div class="clear"></div></div>
-{% if votes %}<div class="clear"><div class="context"><h2>Recent votes</h2></div>
+{% if votes %}<div class="clear"></div><div class="context"><h2>Recent votes</h2></div>
 <div class="focus"><ul class="tile">{% for vote in votes %}<li class="six twoline overflowtip"><a href="{{ vote.get_absolute_url }}">#{{ vote.number }}</a> <span class="tag voteresult_{{ vote.result }}">{{ vote.get_result_display }}</span> {% if vote.bill %}<a href="{{ vote.bill.get_absolute_url }}">{{ vote.bill.number }}</a> {% endif %}{{ vote.description }}</li>{% endfor %}</ul><div class="clear"></div></div>{% endif %}
-<div class="clear"></div><div class="context"><h2>What’s new around here</h2></div>
-<div class="focus"><p>Learn about site updates on our <a href="{% url sitenews_feed %}" class="feed">site news feed</a>, or follow <a href="http://twitter.com/openparlca">@openparlca</a> on Twitter.</p>{% for item in sitenews %}
-<h3 id="n{{ item.id }}">{{ item.title }} <span class="heading_context">{{ item.date|date:"F jS"}}</span></h3>
-{{ item.text|markdown }}{% endfor %}</div>
+
+{% if sitenews %}
+	<div class="clear"></div><div class="context"><h2>What’s new around here</h2></div>
+	<div class="focus" style="position: relative"><p>Subscribe to our <a href="{% url sitenews_feed %}" class="feed">site news feed</a>, or follow <a href="http://twitter.com/openparlca">@openparlca</a> on Twitter.</p><iframe src="http://www.facebook.com/plugins/like.php?href=http%3A%2F%2Fopenparliament.ca%2F&amp;layout=button_count&amp;show_faces=false&amp;width=120&amp;action=like&amp;font&amp;colorscheme=light&amp;height=21" scrolling="no" frameborder="0" style="border:none; overflow:hidden; width:120px; height:21px; position: absolute; right: 30px;top: 0;" allowTransparency="true"></iframe>{% for item in sitenews %}
+	<h3 id="n{{ item.id }}">{{ item.title }} <span class="heading_context">{{ item.date|date:"F jS"}}</span></h3>
+	{{ item.text|markdown }}{% endfor %}</div>
+{% endif %}
 {% endblock %}
 {% block headextra %}
 <script type="text/javascript">
 $(function() {
-   var search_prompt = "Enter a postal code, name, or phrase";
-   var $searchbox = $('#home_searchbox');
-   $searchbox.val(search_prompt); 
-   $searchbox.bind('focus', function() {
-       $searchbox.addClass('active'); 
-       if (this.value == search_prompt) {
-           this.value = '';
-       }
-   }).bind('blur', function () {
-       $searchbox.removeClass('active');
-       if (this.value == '') {
-           this.value = search_prompt;
-       }
-   });
-   $('#home_searchform').bind('submit', function (e) {
-       if ($searchbox.val() == search_prompt) {
-           e.preventDefault();
-           alert('To search, enter a postal code, name, or phrase into the text box.');
-       }
+   $('#home_searchform input').bind('focus', function() {
+	   $('#home_searchbutton').show();
    });
 });
 </script>

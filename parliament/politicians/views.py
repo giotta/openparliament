@@ -1,30 +1,31 @@
 import datetime
+import itertools
 import re
-import urllib
 
-from django.contrib.markup.templatetags.markup import markdown
+from django.conf import settings
 from django.contrib.syndication.views import Feed
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator, InvalidPage, EmptyPage
-from django.http import HttpResponse, Http404, HttpResponseRedirect, HttpResponsePermanentRedirect
-from django.utils.http import urlquote
+from django.http import HttpResponse, Http404, HttpResponsePermanentRedirect
 from django.shortcuts import get_object_or_404
-from django.template import Context, loader, RequestContext
+from django.template import loader, RequestContext
 from django.views.decorators.vary import vary_on_headers
-from django.views.generic.list_detail import object_list
-
-from BeautifulSoup import BeautifulSoup
 
 from parliament.activity.models import Activity
 from parliament.activity import utils as activity
 from parliament.core.models import Politician, ElectedMember
-from parliament.hansards.models import Statement
-    
+from parliament.core.utils import feed_wrapper
+from parliament.hansards.models import Statement, Document
+from parliament.utils.views import JSONView
+
 def current_mps(request):
-    return object_list(request,
-        queryset=ElectedMember.objects.current().order_by('riding__province', 'politician__name_family').select_related('politician', 'riding', 'party'),
-        template_name='politicians/electedmember_list.html',
-        extra_context={'title': 'Current Members of Parliament'})
+    t = loader.get_template('politicians/electedmember_list.html')
+    c = RequestContext(request, {
+        'object_list': ElectedMember.objects.current().order_by(
+            'riding__province', 'politician__name_family').select_related('politician', 'riding', 'party'),
+        'title': 'Current Members of Parliament'
+    })
+    return HttpResponse(t.render(c))
         
 def former_mps(request):
     former_members = ElectedMember.objects.exclude(end_date__isnull=True)\
@@ -58,7 +59,8 @@ def politician(request, pol_id=None, pol_slug=None):
     
     if show_statements:
         STATEMENTS_PER_PAGE = 10
-        statements = pol.statement_set.filter(speaker=False).order_by('-time', '-sequence')
+        statements = pol.statement_set.filter(
+            procedural=False, document__document_type=Document.DEBATE).order_by('-time', '-sequence')
         paginator = Paginator(statements, STATEMENTS_PER_PAGE)
         try:
             pagenum = int(request.GET.get('page', '1'))
@@ -80,11 +82,29 @@ def politician(request, pol_id=None, pol_slug=None):
         'statements_politician_view': True,
         'show_statements': show_statements,
         'activities': activity.iter_recent(Activity.public.filter(politician=pol)),
+        'search_placeholder': u"Search %s in Parliament" % pol.name
     })
     if request.is_ajax():
         t = loader.get_template("hansards/statement_page_politician_view.inc")
     else:
         t = loader.get_template("politicians/politician.html")
+    return HttpResponse(t.render(c))
+
+def contact(request, pol_id=None, pol_slug=None):
+    if pol_slug:
+        pol = get_object_or_404(Politician, slug=pol_slug)
+    else:
+        pol = get_object_or_404(Politician, pk=pol_id)
+
+    if not pol.current_member:
+        raise Http404
+
+    c = RequestContext(request, {
+        'pol': pol,
+        'info': pol.info(),
+        'title': u'Contact %s' % pol.name
+    })
+    t = loader.get_template("politicians/contact.html")
     return HttpResponse(t.render(c))
     
 def hide_activity(request):
@@ -95,10 +115,29 @@ def hide_activity(request):
     activity.active = False
     activity.save()
     return HttpResponse('OK')
-    
+
+class PoliticianAutocompleteView(JSONView):
+
+    def get(self, request):
+
+        q = request.GET.get('q', '').lower()
+
+        if not hasattr(self, 'politician_list'):
+            self.politician_list = list(Politician.objects.elected().values(
+                'name', 'name_family', 'slug', 'id').order_by('name_family'))
+
+        results = (
+            {'value': p['slug'] if p['slug'] else unicode(p['id']), 'label': p['name']}
+            for p in self.politician_list
+            if p['name'].lower().startswith(q) or p['name_family'].lower().startswith(q)
+        )
+        return list(itertools.islice(results, 15))
+politician_autocomplete = PoliticianAutocompleteView.as_view()
+
 class PoliticianStatementFeed(Feed):
     
     def get_object(self, request, pol_id):
+        self.language = request.GET.get('language', settings.LANGUAGE_CODE)
         return get_object_or_404(Politician, pk=pol_id)
     
     def title(self, pol):
@@ -111,7 +150,8 @@ class PoliticianStatementFeed(Feed):
         return "Statements by %s in the House of Commons, from openparliament.ca." % pol.name
         
     def items(self, pol):
-        return Statement.objects.filter(member__politician=pol).order_by('-time')[:12]
+        return Statement.objects.filter(
+            member__politician=pol, document__document_type=Document.DEBATE).order_by('-time')[:12]
         
     def item_title(self, statement):
         return statement.topic
@@ -120,14 +160,17 @@ class PoliticianStatementFeed(Feed):
         return statement.get_absolute_url()
         
     def item_description(self, statement):
-        return markdown(statement.text)
+        return statement.text_html(language=self.language)
         
     def item_pubdate(self, statement):
         return statement.time
+
+politician_statement_feed = feed_wrapper(PoliticianStatementFeed)
         
 r_title = re.compile(r'<span class="tag.+?>(.+?)</span>')
 r_link = re.compile(r'<a [^>]*?href="(.+?)"')
 r_excerpt = re.compile(r'<span class="excerpt">')
+
 class PoliticianActivityFeed(Feed):
 
     def get_object(self, request, pol_id):

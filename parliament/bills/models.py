@@ -1,78 +1,83 @@
-import urllib, urllib2, re
 import datetime
 from collections import defaultdict
+import re
 
+from django.core import urlresolvers
 from django.db import models
-from BeautifulSoup import BeautifulSoup
 
 from parliament.core.models import Session, InternalXref, ElectedMember, Politician, Party
 from parliament.activity import utils as activity
 from parliament.core.utils import memoize_property
 
+import logging
+logger = logging.getLogger(__name__)
 
 CALLBACK_URL = 'http://www2.parl.gc.ca/HousePublications/GetWebOptionsCallBack.aspx?SourceSystem=PRISM&ResourceType=Document&ResourceID=%d&language=1&DisplayMode=2'
 BILL_VOTES_URL = 'http://www2.parl.gc.ca/Housebills/BillVotes.aspx?Language=E&Parl=%s&Ses=%s&Bill=%s'
+
+LEGISINFO_BILL_URL = 'http://www.parl.gc.ca/LegisInfo/BillDetails.aspx?Language=%(lang)s&Mode=1&Bill=%(bill)s&Parl=%(parliament)s&Ses=%(session)s'
+PARLIAMENT_DOCVIEWER_URL = 'http://parl.gc.ca/HousePublications/Publication.aspx?Language=%(lang)s&Mode=1&DocId=%(docid)s'
+
 class BillManager(models.Manager):
-    
-    def get_by_callback_id(self, callback):
-        """Given a callback ID from a link on a Hansard page, return a Bill."""
+
+    def get_by_legisinfo_id(self, legisinfo_id):
+        """Given a House of Commons ID (e.g. from LEGISinfo, or a Hansard link),
+        return a Bill, creating it if necessary."""
+        legisinfo_id = int(legisinfo_id)
         try:
-            xref = InternalXref.objects.get(schema='bill_callbackid', int_value=callback)
-            if xref.target_id < 0:
-                raise Bill.DoesNotExist("Stored as invalid callback")
-            return self.get_query_set().get(pk=xref.target_id)
-        except InternalXref.DoesNotExist:
-            pass
-            
-        callpage = urllib2.urlopen(CALLBACK_URL % callback)
-        
-        match = re.search(r'Parl=(\d+)&Ses=(\d)(?:&Bill=|#)([CS][0-9]+[A-Z]?)', callpage.read())
-        if not match:
-            print "Couldn't find parseable link in get_by_callback_id"
-            raise Bill.DoesNotExist()
-        (parliamentnum, sessnum, billnum) = match.groups()
-        billnum = billnum[0] + '-' + billnum[1:] # we use the C-52 style, not C52\
-        session = Session.objects.get(parliamentnum=parliamentnum, sessnum=sessnum)
-        try:
-            bill = self.get_query_set().get(number=billnum, sessions=session)
+            return self.get(billinsession__legisinfo_id=legisinfo_id)
         except Bill.DoesNotExist:
-            # Let's see if we can get the bill name
-            billname = ''
-            if billnum[0] == 'C':
-                try:
-                    votespage = urllib2.urlopen(BILL_VOTES_URL %
-                        (parliamentnum, sessnum, billnum.replace('-', '')))
-                    votesoup = BeautifulSoup(votespage.read())
-                    votediv = votesoup.find('div', 'VotesBill')
-                    billname = votediv.string.strip()
-                except Exception as e:
-                    print e # FIXME logging
-            
-            bill = Bill(name=billname, number=billnum, institution=billnum[0])
-            bill.session = session
-            bill.save()
-        
-        InternalXref(schema='bill_callbackid', int_value=callback, target_id=bill.id).save()
-        return bill
-        
+            from parliament.imports import legisinfo
+            return legisinfo.import_bill_by_id(legisinfo_id)
+
+    def create_temporary_bill(self, number, session, legisinfo_id=None):
+        """Creates a bare-bones Bill object, to be filled in later.
+
+        Used because often it'll be a day or two between when a bill ID is
+        first referenced in Hansard and when it shows up in LEGISinfo.
+        """
+        if legisinfo_id:
+            legisinfo_id = int(legisinfo_id)
+            if BillInSession.objects.filter(legisinfo_id=int(legisinfo_id)).exists():
+                raise Bill.MultipleObjectsReturned(
+                    "There's already a bill with LEGISinfo id %s" % legisinfo_id)
+        try:
+            bill = Bill.objects.get(number=number, sessions=session)
+            logger.error("Potential duplicate LEGISinfo ID: %s in %s exists, but trying to create with ID %s" %
+                (number, session, legisinfo_id))
+            return bill
+        except Bill.DoesNotExist:
+            bill = self.create(number=number)
+            BillInSession.objects.create(bill=bill, session=session,
+                    legisinfo_id=legisinfo_id)
+            return bill
 
 class Bill(models.Model):
     
     name = models.TextField(blank=True)
+    name_fr = models.TextField(blank=True)
+    short_title_en = models.TextField(blank=True)
+    short_title_fr = models.TextField(blank=True)
     number = models.CharField(max_length=10)
     number_only = models.SmallIntegerField()
     institution = models.CharField(max_length=1, db_index=True, choices=(
         ('C', 'House'),
         ('S', 'Senate'),
     ))
-    sessions = models.ManyToManyField(Session)
-    legisinfo_url = models.URLField(blank=True, null=True, verify_exists=False)
+    sessions = models.ManyToManyField(Session, through='BillInSession')
     privatemember = models.NullBooleanField()
     sponsor_member = models.ForeignKey(ElectedMember, blank=True, null=True)
     sponsor_politician= models.ForeignKey(Politician, blank=True, null=True)
     law = models.NullBooleanField()
+
+    # TODO: Remodel status to allow multiple status events, with dates
     status = models.CharField(max_length=200, blank=True)
+    status_fr = models.CharField(max_length=200, blank=True)
+    status_date = models.DateField(blank=True, null=True)
     added = models.DateField(default=datetime.date.today, db_index=True)
+    introduced = models.DateField(blank=True, null=True)
+    text_docid = models.IntegerField(blank=True, null=True,
+        help_text="The parl.gc.ca document ID of the latest version of the bill's text")
     
     objects = BillManager()
     
@@ -82,28 +87,48 @@ class Bill(models.Model):
     def __unicode__(self):
         return "%s - %s" % (self.number, self.name)
         
-    @models.permalink
     def get_absolute_url(self):
-        return ('parliament.bills.views.bill_pk_redirect', [self.id])
+        return self.url_for_session(self.session)
+
+    def url_for_session(self, session):
+        return urlresolvers.reverse('parliament.bills.views.bill', kwargs={
+            'session_id': session.id, 'bill_number': self.number})
         
-    def get_legisinfo_billtext_url(self):
-        return self.legisinfo_url.replace('List=toc', 'List=toc-1')
+    def get_legisinfo_url(self, lang='E'):
+        return LEGISINFO_BILL_URL % {
+            'lang': lang,
+            'bill': self.number.replace('-', ''),
+            'parliament': self.session.parliamentnum,
+            'session': self.session.sessnum
+        }
+        
+    legisinfo_url = property(get_legisinfo_url)
+        
+    def get_billtext_url(self, lang='E'):
+        if not self.text_docid:
+            return None
+        return PARLIAMENT_DOCVIEWER_URL % {
+            'lang': lang,
+            'docid': self.text_docid
+        }
         
     def save(self, *args, **kwargs):
         if not self.number_only:
             self.number_only = int(re.sub(r'\D', '', self.number))
         if getattr(self, 'privatemember', None) is None:
             self.privatemember = bool(self.number_only >= 200)
+        if not self.institution:
+            self.institution = self.number[0]
+        if not self.law and 'Royal Assent' in self.status:
+            self.law = True
         super(Bill, self).save(*args, **kwargs)
-        if getattr(self, '_save_session', None):
-            self.sessions.add(self._save_session)
 
     def save_sponsor_activity(self):
         if self.sponsor_politician:
             activity.save_activity(
                 obj=self,
                 politician=self.sponsor_politician,
-                date=self.added - datetime.timedelta(days=1), # we generally pick it up the day after it appears
+                date=self.introduced if self.introduced else (self.added - datetime.timedelta(days=1)),
                 variety='billsponsor',
             )
         
@@ -113,16 +138,38 @@ class Bill(models.Model):
         try:
             return self.sessions.all().order_by('-start')[0]
         except (IndexError, ValueError):
-            return getattr(self, '_save_session', None)
-            
-    def set_session(self, session):
-        self._save_session = session
+            return getattr(self, '_session', None)
+
+    def set_temporary_session(self, session):
+        """To deal with tricky save logic, saves a session to the object for cases
+        when self.sessions.all() won't get exist in the DB."""
+        self._session = session
         
-    session = property(get_session, set_session)
+    session = property(get_session)
+
+class BillInSession(models.Model):
+    """Represents a bill, as introduced in a single session.
+
+    All bills are, technically, introduced only in a single session.
+    But, in a decision which ended up being pretty complicated, we combine
+    reintroduced bills into a single Bill object. But it's this model
+    that maps one-to-one to most IDs used elsewhere.
+    """
+    bill = models.ForeignKey(Bill)
+    session = models.ForeignKey(Session)
+
+    legisinfo_id = models.PositiveIntegerField(db_index=True, blank=True, null=True)
+    introduced = models.DateField(blank=True, null=True)
+    sponsor_politician= models.ForeignKey(Politician, blank=True, null=True)
+    sponsor_member = models.ForeignKey(ElectedMember, blank=True, null=True)
+
+    def __unicode__(self):
+        return u"%s in session %s" % (self.bill, self.session_id)
+
         
 VOTE_RESULT_CHOICES = (
     ('Y', 'Passed'), # Agreed to
-    ('N', 'Failed'), # Negatives
+    ('N', 'Failed'), # Negatived
     ('T', 'Tie'),
 )
 class VoteQuestion(models.Model):
@@ -136,6 +183,8 @@ class VoteQuestion(models.Model):
     yea_total = models.SmallIntegerField()
     nay_total = models.SmallIntegerField()
     paired_total = models.SmallIntegerField()
+    context_statement = models.ForeignKey('hansards.Statement',
+        blank=True, null=True, on_delete=models.SET_NULL)
     
     def __unicode__(self):
         return u"Vote #%s on %s" % (self.number, self.date)

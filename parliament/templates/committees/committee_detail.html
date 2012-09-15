@@ -1,0 +1,48 @@
+{% extends "committees/base.html" %}
+{% block breadcrumbs %}<a href="{% url committee_list %}">Committees</a> {{ committee.short_name }}{% endblock %}
+{% block content %}
+
+	<div class="focus">
+		<form action="{% url search %}" method="GET" class="prepender">
+			<input type="hidden" name="prepend" value="Committee: &quot;{{ committee.slug }}&quot;">
+			{% include "search/searchbox.inc" with placeholder=search_placeholder %}
+		</form>
+			<p style="margin-top: 20px;">
+				{% if committee.parent %}
+				This is a subcommittee of the <a href="{{ committee.parent.get_absolute_url }}">{{ committee.parent }}</a> committee.</p>
+				{% endif %}
+				Visit this committee on <a href="{{ committee.get_source_url }}">Parliament&rsquo;s site</a>.
+			</p>
+	</div><div class="clear"></div>
+
+    <div class="context"><h2>Meetings</h2></div>
+    <div class="focus">
+	{% include "committees/meeting_list.html.inc" %}
+	</div><div class="clear"></div>
+
+	{% if subcommittees %}
+		<div class="context"><h2>Subcommittee{{ subcommittees|pluralize }}</h2></div>
+		<div class="focus">
+			<ul class="tile">
+				{% for subc in subcommittees %}<li class="six"><a href="{{ subc.get_absolute_url }}">{{ subc }}</a></li>{% endfor %}
+			</ul>
+		</div><div class="clear"></div>
+	{% endif %}
+
+	{% if recent_studies %}
+	<div class="context"><h2>Recent studies</h2></div>
+	<div class="focus">
+		<ul class="tile">
+			{% for study in recent_studies %}<li class="six twoline overflowtip"><a href="{{ study.get_absolute_url }}">{{ study }}</a></li>{% endfor %}
+		</ul>
+	</div><div class="clear"></div>
+	{% endif %}
+	{% if archive_years %}
+	<div class="context"><h2>Archive</h2></div>
+	<div class="focus">
+		<ul class="tile">
+			{% for year in archive_years %}<li class="three oneline"><a href="{% url committee_year_archive slug=committee.slug,year=year %}">{{ year }}</a></li>{% endfor %}
+		</ul>
+	</div><div class="clear"></div>
+	{% endif %}
+{% endblock %}

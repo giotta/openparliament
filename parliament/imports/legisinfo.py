@@ -1,133 +1,183 @@
-import urllib, urllib2, re
 import datetime
+import urllib2
 
-from BeautifulSoup import BeautifulSoup
-from django.db import models, transaction
-from django.core.mail import mail_admins
-import feedparser
+from django.db import transaction
 
-from parliament.core.models import InternalXref, Politician, ElectedMember, Session
-from parliament.bills.models import Bill
-from parliament.activity import utils as activity
+from lxml import etree
 
-LEGISINFO_LIST_URL = 'http://www2.parl.gc.ca/Sites/LOP/LEGISINFO/index.asp?Language=E&List=list&Type=%s&Chamber=%s&StartList=2&EndList=2000&Session=%d'
-LEGISINFO_DETAIL_URL = 'http://www2.parl.gc.ca/Sites/LOP/LEGISINFO/index.asp?Language=E&Session=%d&query=%d&List=toc'
+from parliament.bills.models import Bill, BillInSession
+from parliament.core.models import Session, Politician, ElectedMember
 
+import logging
+logger = logging.getLogger(__name__)
+
+LEGISINFO_XML_LIST_URL = 'http://parl.gc.ca/LegisInfo/Home.aspx?language=E&Parl=%(parliament)s&Ses=%(session)s&Page=%(page)s&Mode=1&download=xml'
+LEGISINFO_SINGLE_BILL_URL = 'http://www.parl.gc.ca/LegisInfo/BillDetails.aspx?Language=E&Mode=1&billId=%(legisinfo_id)s&download=xml'
+
+def _parse_date(d):
+    return datetime.date(*[int(x) for x in d[:10].split('-')])
+
+def _get_previous_session(session):
+    try:
+        return Session.objects.filter(start__lt=session.start)\
+            .order_by('-start')[0]
+    except IndexError:
+        return None
 
 @transaction.commit_on_success
-def import_bills(session, institution='C'):
-    previous_session = Session.objects.filter(start__lt=session.start)\
-        .order_by('-start')[0] # yes, this will raise an exception if there's no older session on record
+def import_bills(session):
+    """Import bill data from LegisInfo for the given session.
     
-    legis_sess = InternalXref.objects.get(text_value=session.id, schema='session_legisin').int_value
-    for billtype in [0,1,2,3]:
-        listurl = LEGISINFO_LIST_URL % (billtype, institution, legis_sess)
-        listpage = urllib2.urlopen(listurl).read()
+    session should be a Session object"""
     
-        r_listlink = re.compile(r'<a href="index\.asp\?Language=E&Session=\d+&query=(\d+)&List=toc">\s*([CS]-\d+[A-Z]?)\s*</a>', re.UNICODE)
-        for match in r_listlink.finditer(listpage):
-            legisinfoid = int(match.group(1))
-            billnumber_full = match.group(2)
-            try:
-                bill = Bill.objects.get(sessions=session, number=billnumber_full)
-            except Bill.DoesNotExist:
-                bill = None
+    previous_session = _get_previous_session(session)
         
-            if not getattr(bill, 'legisinfo_url', None):
-                # Not yet in the database. Go parse.
-                detailurl = LEGISINFO_DETAIL_URL % (legis_sess, legisinfoid)
-                try:
-                    detailpage = urllib2.urlopen(detailurl).read().decode('windows-1252')
-                except urllib2.URLError, e:
-                    print "ERROR: URLError on %s" % detailurl
-                    print e
-                    continue
-                match = re.search(r'<td>\s*(An [aA]ct.+?)<br', detailpage)
-                if not match:
-                    soup = BeautifulSoup(detailpage)
-                    try:
-                        billname = unicode(soup.find(text=billnumber_full).next.next.next)
-                        print "WARNING: soupmatching bill name as %s" % billname
-                    except Exception, e:
-                        print "Couldn't parse bill name at %s" % detailurl
-                        print e
-                        continue
-                else:
-                    billname = match.group(1)
-            
-                # Is this a reintroduced bill?
-                merging = False
-                try:
-                    mergebill = Bill.objects.get(sessions=previous_session, number=billnumber_full, name__iexact=billname)
-                    if not bill:
-                        bill = mergebill
-                        merging = True
-                        print "MERGING BILL"
-                    else:
-                        mail_admins('Bills may need to be merged', "%s: ids %s %s" % (billnumber_full, mergebill.id, bill.id))
-                except Bill.DoesNotExist:
-                    # Nope. New bill.
-                    if not bill:
-                        bill = Bill(number=billnumber_full, name=billname, institution=institution)
-                        bill.session = session
-            
-                if bill.session != session:
-                    bill.sessions.add(session)
-            
-                bill.legisinfo_url = detailurl
-                if billname and not bill.name:
-                    bill.name = billname
-            
-                membermatch = re.search(r'<font color="#005500"><b><a href=.http://www2\.parl\.gc\.ca/parlinfo/Files/Parliamentarian\.aspx\?Item=([A-Z0-9-]+?)&.+?>(.+?)<', detailpage)
-                if membermatch:
-                    try:
-                        bill.sponsor_politician = Politician.objects.get_by_parlinfo_id(membermatch.group(1))
-                    except models.ObjectDoesNotExist:
-                        membername = membermatch.group(2)
-                        membername = re.sub(r'\(.+?\)', '', membername) # parens
-                        membername = re.sub(r'.+ Hon\.', '', membername) # honorific
-                        try:
-                            bill.sponsor_politician = Politician.objects.get_by_name(membername.strip(), session=session)
-                            bill.sponsor_politician.save_parlinfo_id(membermatch.group(1))
-                        except (Politician.DoesNotExist, Politician.MultipleObjectsReturned):
-                            print "WARNING: Could not identify politician for bill %s" % billnumber_full
-                    if bill.sponsor_politician:
-                        try:
-                            bill.sponsor_member = ElectedMember.objects.get_by_pol(politician=bill.sponsor_politician,
-                                session=session)
-                        except:
-                            print "WARNING: Couldn't find member for politician %s" % bill.sponsor_politician
-                bill.save()
-                bill.save_sponsor_activity()
+    page = 0
+    fetch_next_page = True
+    while fetch_next_page:
+        page += 1
+        url = LEGISINFO_XML_LIST_URL % {
+            'parliament': session.parliamentnum,
+            'session': session.sessnum,
+            'page': page
+        }
+        tree = etree.parse(urllib2.urlopen(url))
+        bills = tree.xpath('//Bill')
+        if len(bills) < 500:
+            # As far as I can tell, there's no indication within the XML file of
+            # whether it's a partial or complete list, but it looks like the 
+            # limit for one file/page is 500.
+            fetch_next_page = False
+
+        for lbill in bills:
+            _import_bill(lbill,session, previous_session)
+
     return True
 
-LEGISINFO_STATUS_URL = 'http://www2.parl.gc.ca/Sites/LOP/LEGISINFO/RSSFeeds.asp?parlNumber=%(parliamentnum)s&session=%(sessnum)s&chamber=%(chamber)s&billNumber=%(billnum)s&billLetter=%(billletter)s&language=E'
-
-def get_bill_feed(bill):
-    return feedparser.parse(LEGISINFO_STATUS_URL % {
-        'parliamentnum': bill.session.parliamentnum,
-        'sessnum': bill.session.sessnum,
-        'billnum': re.sub(r'\D', '', bill.number),
-        'billletter': re.sub(r'[^A-Z]', '', bill.number[1:]),
-        'chamber': bill.number[0],
-    })
-
-def update_bill_status(bill):
-    feed = get_bill_feed(bill)
-    try:
-        status = feed['items'][-1]['title']
-    except Exception, e:
-        print "Error parsing feed for %s" % bill
-        print e
-        return False
-    bill.status = status
-    bill.law = bool('Royal Assent' in status)
-    bill.save()
+def import_bill_by_id(legisinfo_id):
+    """Imports a single bill based on its LEGISinfo id."""
     
-def update_statuses_for_session(session, private_members_also=True):
-    #print "Updating statuses for %s" % session
-    bills = Bill.objects.filter(sessions=session).exclude(law=True).exclude(number_only=1)
-    if not private_members_also:
-        bills = bills.exclude(privatemember=True)
-    for bill in bills:
-        update_bill_status(bill)
+    url = LEGISINFO_SINGLE_BILL_URL % {'legisinfo_id': legisinfo_id}
+    try:
+        tree = etree.parse(urllib2.urlopen(url))
+    except urllib2.HTTPError:
+        raise Bill.DoesNotExist("HTTP error retrieving bill")
+    bill = tree.xpath('/Bill')
+    assert len(bill) == 1
+    bill = bill[0]
+
+    sessiontag = bill.xpath('ParliamentSession')[0]
+    session = Session.objects.get(parliamentnum=int(sessiontag.get('parliamentNumber')),
+        sessnum=int(sessiontag.get('sessionNumber')))
+    return _import_bill(bill, session)
+
+def _update(obj, field, value):
+    if value is None:
+        return
+    if not isinstance(value, datetime.date):
+        value = unicode(value)
+    if getattr(obj, field) != value:
+        setattr(obj, field, value)
+        obj._changed = True
+
+def _import_bill(lbill, session, previous_session=None):
+    #lbill should be an ElementTree Element for the Bill tag
+
+    if previous_session is None:
+        previous_session = _get_previous_session(session)
+
+    lbillnumber = lbill.xpath('BillNumber')[0]
+    billnumber = (lbillnumber.get('prefix') + '-' + lbillnumber.get('number')
+        + lbillnumber.get('suffix', ''))
+    try:
+        bill = Bill.objects.get(number=billnumber, sessions=session)
+        bis = bill.billinsession_set.get(session=session)
+    except Bill.DoesNotExist:
+        bill = Bill(number=billnumber)
+        bis = BillInSession(bill=bill, session=session)
+        bill._changed = True
+        bis._changed = True
+        bill.set_temporary_session(session)
+
+    _update(bill, 'name', lbill.xpath('BillTitle/Title[@language="en"]')[0].text)
+
+    if not bill.status:
+        # This is presumably our first import of the bill; check if this
+        # looks like a reintroduced bill and we want to merge with an
+        # older Bill object.
+        bill._newbill = True
+        try:
+            if previous_session:
+                mergebill = Bill.objects.get(sessions=previous_session,
+                                             number=bill.number,
+                                             name__iexact=bill.name)
+
+                if bill.id:
+                    # If the new bill has already been saved, let's not try
+                    # to merge automatically
+                    logger.error("Bill %s may need to be merged. IDs: %s %s" %
+                                 (bill.number, bill.id, mergebill.id))
+                else:
+                    logger.warning("Merging bill %s" % bill.number)
+                    bill = mergebill
+                    bis.bill = bill
+        except Bill.DoesNotExist:
+            # Nothing to merge
+            pass
+
+    _update(bill, 'name_fr', lbill.xpath('BillTitle/Title[@language="fr"]')[0].text)
+    _update(bill, 'short_title_en', lbill.xpath('ShortTitle/Title[@language="en"]')[0].text)
+    _update(bill, 'short_title_fr', lbill.xpath('ShortTitle/Title[@language="fr"]')[0].text)
+
+    if not bis.sponsor_politician and bill.number[0] == 'C' and lbill.xpath('SponsorAffiliation/@id'):
+        # We don't deal with Senate sponsors yet
+        pol_id = int(lbill.xpath('SponsorAffiliation/@id')[0])
+        try:
+            bis.sponsor_politician = Politician.objects.get_by_parl_id(pol_id)
+        except Politician.DoesNotExist:
+            logger.error("Couldn't find sponsor politician for bill %s, pol ID %s" % (bill.number, pol_id))
+        bis._changed = True
+        try:
+            bis.sponsor_member = ElectedMember.objects.get_by_pol(politician=bis.sponsor_politician,
+                                                                   session=session)
+        except Exception:
+            logger.error("Couldn't find ElectedMember for bill %s, pol %r" %
+                         (bill.number, bis.sponsor_politician))
+        if not bill.sponsor_politician:
+            bill.sponsor_politician = bis.sponsor_politician
+            bill.sponsor_member = bis.sponsor_member
+            bill._changed = True
+
+    _update(bis, 'introduced', _parse_date(lbill.xpath('BillIntroducedDate')[0].text))
+    if not bill.introduced:
+        bill.introduced = bis.introduced
+
+    try:
+        _update(bill, 'status',
+            lbill.xpath('Events/LastMajorStageEvent/Event/Status/Title[@language="en"]')[0].text)
+        _update(bill, 'status_fr',
+            lbill.xpath('Events/LastMajorStageEvent/Event/Status/Title[@language="fr"]')[0].text)
+        _update(bill, 'status_date', _parse_date(
+            lbill.xpath('Events/LastMajorStageEvent/Event/@date')[0]))
+    except IndexError:
+        # Some older bills don't have status information
+        pass
+
+    try:
+        _update(bill, 'text_docid', int(
+            lbill.xpath('Publications/Publication/@id')[-1]))
+    except IndexError:
+        pass
+
+    _update(bis, 'legisinfo_id', int(lbill.get('id')))
+
+    if getattr(bill, '_changed', False):
+        bill.save()
+    if getattr(bis, '_changed', False):
+        bis.bill = bis.bill # bizarrely, the django orm makes you do this
+        bis.save()
+    if getattr(bill, '_newbill', False) and not session.end:
+        bill.save_sponsor_activity()
+
+    return bill
+            

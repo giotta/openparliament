@@ -6,8 +6,10 @@ from parliament.search.utils import SearchIndex
 
 class PolIndex(SearchIndex):
     text = indexes.CharField(document=True, use_template=True)
-    sci = indexes.CharField(use_template=True, stored=False)
-    pol_name = indexes.CharField(model_attr='name', indexed=False)
+    boosted = indexes.CharField(use_template=True, stored=False)
+    politician = indexes.CharField(model_attr='name', indexed=False)
+    party = indexes.CharField(model_attr='latest_member__party__short_name')
+    province = indexes.CharField(model_attr='latest_member__riding__province')
     url = indexes.CharField(model_attr='get_absolute_url', indexed=False)
     #dob = indexes.DateTimeField(model_attr='dob')
     

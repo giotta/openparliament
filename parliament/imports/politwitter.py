@@ -3,30 +3,36 @@ import urllib2
 
 from django.conf import settings
 
-from lxml import objectify
+from lxml import etree, objectify
 import twitter
 
-from parliament.core.models import Politician, PoliticianInfo
+from parliament.core.models import Politician, PoliticianInfo, Session
 
 import logging
 logger = logging.getLogger(__name__)
 
 def import_twitter_ids():
     source = urllib2.urlopen('http://politwitter.ca/api.php?format=xml&call=listmp')
-    tree = objectify.parse(source)
+    # politwitter XML sometimes includes invalid entities
+    parser = objectify.makeparser(recover=True)
+    tree = objectify.parse(source, parser)
+    current_session = Session.objects.current()
     for member in tree.xpath('//member'):
-        if not member.website_official:
-            logger.info("No website for %s" % member.name)
-            continue
-        parlid = re.search(r'Key=(\d+)&', str(member.website_official)).group(1)
-        pol = Politician.objects.get_by_parl_id(parlid)
+        try:
+            pol = Politician.objects.get_by_name(unicode(member.name), session=current_session)
+        except Politician.DoesNotExist:
+            print "Could not find politician %r" % member.name
         current = pol.info().get('twitter')
         new = str(member.twitter_username)
-        if str(current).lower() != new.lower():
+        if new and str(current).lower() != new.lower():
             logger.error(u"Twitter username change for %s: %s -> %s"
                 % (pol, current, new))
             if not current:
-                pol.set_info('twitter', new)
+                try:
+                    pol.set_info('twitter_id', get_id_from_screen_name(new))
+                    pol.set_info('twitter', new)
+                except Exception as e:
+                    print repr(e)
                 
 def update_twitter_list():
     from twitter import twitter_globals
@@ -50,4 +56,16 @@ def update_twitter_list():
     t.user.listname.members.create_all(user=settings.TWITTER_USERNAME, listname=settings.TWITTER_LIST_NAME,
         screen_name=','.join(not_on_list))
     logger.warning("Users added to Twitter list: %r" % not_on_list)
+    
+def get_id_from_screen_name(screen_name):
+    t = twitter.Twitter(auth=twitter.OAuth(**settings.TWITTER_OAUTH), domain='api.twitter.com/1')
+    return t.users.show(screen_name=screen_name)['id']
+    
+def get_ids_from_screen_names():
+    for p in Politician.objects.current():
+        if 'twitter' in p.info() and 'twitter_id' not in p.info():
+            try:
+                p.set_info('twitter_id', get_id_from_screen_name(p.info()['twitter']))
+            except Exception:
+                logger.exception(u"Couldn't get twitter ID for %s" % p.name)
         

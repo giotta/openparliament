@@ -5,8 +5,9 @@ from BeautifulSoup import NavigableString
 
 r_politicalpost = re.compile(r'(Minister|Leader|Secretary|Solicitor|Attorney|Speaker|Deputy |Soliciter|Chair |Parliamentary|President |for )')
 r_honorific = re.compile(r'^(Mr\.?|Mrs\.?|Ms\.?|Miss\.?|Hon\.?|Right Hon\.|The|A|An\.?|Some|M\.|One|Santa|Acting|L\'hon\.|Assistant|Mme)\s(.+)$', re.DOTALL | re.UNICODE)
-r_notamember = re.compile(r'^(The|A|Some|Acting|Santa|One|Assistant|An\.?)')
+r_notamember = re.compile(r'^(The|A|Some|Acting|Santa|One|Assistant|An\.?|Le|La|Une|Des|Voices)')
 r_mister = re.compile(r'^(Mr|Mrs|Ms|Miss|Hon|Right Hon|M|Mme)\.?\s+')
+r_parens = re.compile(r'\s*\(.+\)\s*$')
 
 def countWords(text):
     # very quick-n-dirty for now
@@ -16,6 +17,19 @@ def time(hour, minute):
     if hour >= 24:
         hour = hour % 24 # no, really. the house of commons is so badass they meet at 25 o'clock
     return datetime.time(hour=hour, minute=minute)
+
+def time_to_datetime(hour, minute, date):
+    """Given hour, minute, and a datetime.date, returns a datetime.datetime.
+
+    Necessary to deal with the occasional wacky 25 o'clock timestamps in Hansard.
+    """
+    if hour < 24:
+        return datetime.datetime.combine(date, datetime.time(hour=hour, minute=minute))
+    else:
+        return datetime.datetime.combine(
+            date + datetime.timedelta(days=hour//24),
+            datetime.time(hour=hour % 24, minute=minute)
+        )
 
 def normalizeHansardURL(u):
     docid = re.search(r'DocId=(\d+)', u).group(1)
@@ -50,12 +64,16 @@ def tameWhitespace(s):
 def sane_quotes(s):
     return s.replace('``', '"').replace("''", '"')
     
-def slugify(s):
-    s = re.sub(r'[^a-zA-Z]', '-', removeAccents(s.strip().lower()))
+def slugify(s, allow_numbers=False):
+    if allow_numbers:
+        pattern = r'[^a-zA-Z0-9]'
+    else:
+        pattern = r'[^a-zA-Z]'
+    s = re.sub(pattern, '-', removeAccents(s.strip().lower()))
     return re.sub(r'--+', '-', s)
 
 def normalizeName(s):
-    return tameWhitespace(removeAccents(stripHonorific(s).lower()))
+    return tameWhitespace(removeAccents(stripHonorific(s).lower())).strip()
 
 def munge_date(date):
     if date.count('0000') > 0:

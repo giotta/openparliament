@@ -1,3 +1,6 @@
+import datetime
+
+from django.conf import settings
 from django.contrib.markup.templatetags.markup import markdown
 from django.contrib.syndication.views import Feed
 from django.http import HttpResponse, Http404, HttpResponseRedirect, HttpResponsePermanentRedirect
@@ -7,14 +10,16 @@ from django.views.decorators.cache import never_cache
 
 from parliament.core.models import Session, SiteNews
 from parliament.bills.models import VoteQuestion
-from parliament.hansards.models import Hansard
+from parliament.hansards.models import Document
+from parliament.core.models import Session, SiteNews
 
 def home(request):
     
     t = loader.get_template("home.html")
     c = RequestContext(request, {
-        'latest_hansard': Hansard.objects.all()[0],
-        'sitenews': SiteNews.objects.filter(active=True)[:6],
+        'latest_hansard': Document.debates.all()[0],
+        'sitenews': SiteNews.objects.filter(active=True,
+            date__gte=datetime.datetime.now() - datetime.timedelta(days=60))[:6],
         'votes': VoteQuestion.objects.filter(session=Session.objects.current())\
             .select_related('bill')[:6],
     })
@@ -27,6 +32,20 @@ def closed(request, message=None):
     resp = flatpage_response(request, 'closedparliament.ca', message)
     resp.status_code = 503
     return resp
+
+@never_cache
+def db_readonly(request, *args, **kwargs):
+    title = "Temporarily unavailable"
+    message = """We're currently running on our backup database, and this particular functionality is down.
+        It should be back up soon. Sorry for the inconvenience!"""
+    resp = flatpage_response(request, title, message)
+    resp.status_code = 503
+    return resp
+
+def disable_on_readonly_db(view):
+    if settings.PARLIAMENT_DB_READONLY:
+        return db_readonly
+    return view
     
 def flatpage_response(request, title, message):
     t = loader.get_template("flatpages/default.html")
